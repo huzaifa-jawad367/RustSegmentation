@@ -14,10 +14,12 @@ from DatasetPrep import get_dataset
 from pynvml import *
 import cv2
 from PIL import Image
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+from accelerate import Accelerator
 
 class RustDataset(Dataset):
 
@@ -46,12 +48,12 @@ class RustDataset(Dataset):
         img = Image.open(os.path.join(self.img_path, image_name))
         mask = Image.open(os.path.join(self.mask_path, mask_name)).convert('L')
 
-        sample = {'image': img, 'mask': mask}
+        sample = {'pixel_values': img, 'labels': mask}
 
         if self.transform:
-            img = self.transform(sample['image'])
-            mask = torch.from_numpy(mask).long()
-            sample = {'image': img, 'mask': mask}
+            img = self.transform(sample['pixel_values'])
+            mask = torch.from_numpy(np.array(mask)).long()
+            sample = {'pixel_values': img, 'labels': mask}
 
         return sample
     
@@ -118,11 +120,8 @@ def run_1_epoch(model, loss_fn, loader, optimizer = None, train = False):
         # Acquire predicted class indices
         _, predicted = torch.max(output.data, 1) # the dimension 1 corresponds to max along the rows
 
-        # Removing extra last dimension from output tensor
-        #output.squeeze_(-1)
-
         # Compute the loss for the minibatch
-        loss = loss_function(output, labels)
+        loss = loss_fn(output, labels)
 
         # Backpropagation
         if train:
@@ -145,6 +144,11 @@ def run_1_epoch(model, loss_fn, loader, optimizer = None, train = False):
     return loss, accuracy, mean_IoU
     
 if __name__ == "__main__":
+
+    torch.cuda.empty_cache()
+
+    accelerator = Accelerator()
+
     mean=[0.485, 0.456, 0.406]
     std=[0.229, 0.224, 0.225]
 
@@ -164,12 +168,15 @@ if __name__ == "__main__":
         T.Normalize(mean, std)
     ])
 
+    # device = torch.device('cuda')
+    device = accelerator.device
+
     #datasets
     train_set = RustDataset(IMAGE_PATH, MASK_PATH, mean, std, train_transform)
     val_set = RustDataset(IMAGE_PATH, MASK_PATH, mean, std, val_transform)
 
     #dataloader
-    batch_size= 8
+    batch_size= 4
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=True, num_workers=4)
@@ -189,12 +196,18 @@ if __name__ == "__main__":
         pretrained_model_name,
         id2label=id2label,
         label2id=label2id
-    ).to("cuda")
+    ).to(device)
 
     loss_function = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.00006)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.1)
     epochs = 10
+
+    accelerator = Accelerator(gradient_accumulation_steps=2)
+
+    model, optimizer, train_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, scheduler
+    )
 
     train_accuracies = []
     val_accuracies = []
@@ -210,110 +223,149 @@ if __name__ == "__main__":
     checkpoint_path = 'segformer_results/checkpoint.pth'
     best_val_checkpoint_path = 'segformer_results/best_val_checkpoint.pth'
 
-    # Start epoch is zero for new training
+    # Start epoch is zer
+    # o for new training
+    num_training_steps = 1000
     start_epoch = 0
+    progress_bar = tqdm(range(num_training_steps))
+
+    model.train()
 
     for epoch in range(start_epoch, epochs):
 
-        # Train model for one epoch
+        # # with torch.no_grad:
+        # model.zero_grad()
+        for batch in train_loader:
 
-        # Get the current learning rate from the optimizer
-        current_lr = optimizer.param_groups[0]['lr']
+            with accelerator.accumulate(model):
 
-        print("Epoch %d: Train \nLearning Rate: %.6f"%(epoch, current_lr))
-        train_loss, train_accuracy, train_mIoU  = run_1_epoch(model, loss_function, train_loader, optimizer, train= True)
+                batch = {k: v for k, v in batch.items()}
+                outputs = model(**batch)
+                loss = outputs.loss
+                # loss.backward()
+                accelerator.backward(loss=loss)
 
-        # Update the learning rate scheduler
-        scheduler.step()
+                print()
+                print(f"Loss: {loss}")
+                train_losses.append(loss)
 
-        # Lists for train loss and accuracy for plotting
-        train_losses.append(train_loss)
-        train_accuracies.append(train_accuracy)
-        train_mIoUs.append(train_mIoU)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                progress_bar.update(1)
 
-        # Validate the model on validation set
-        print("Epoch %d: Validation"%(epoch))
-        with torch.no_grad():
-            val_loss, val_accuracy, val_mIoU  = run_1_epoch(model, loss_function, val_loader, optimizer, train= False)
+                metric = evaluate.load("accuracy")
+                model.eval()
+                for batch in eval_dataloader:
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    with torch.no_grad():
+                        outputs = model(**batch)
 
-        # Lists for val loss and accuracy for plotting
-        val_losses.append(val_loss)
-        val_accuracies.append(val_accuracy)
-        val_mIoUs.append(val_mIoU)
+                    logits = outputs.logits
+                    predictions = torch.argmax(logits, dim=-1)
+                    metric.add_batch(predictions=predictions, references=batch["labels"])
 
-        print('train loss: %.4f'%(train_loss))
-        print('val loss: %.4f'%(val_loss))
-        print('train_accuracy %.2f' % (train_accuracy))
-        print('val_accuracy %.2f' % (val_accuracy))
-        print('train_IoU %.2f'%(train_mIoU))
-        print('val_IoU %.2f'%(val_mIoU))
+        model.save()
 
-        if val_mIoU > val_mIoU_max:
-            val_mIoU_max = val_mIoU
-            print("New max val mean IoU Acheived %.2f. Saving model.\n\n"%(val_mIoU_max))
+        #     # Train model for one epoch
 
-            checkpoint = {
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'trianed_epochs': epoch,
-            'train_losses': train_losses,
-            'train_accuracies': train_accuracies,
-            'train_mIoUs': train_mIoUs,
-            'val_losses': val_losses,
-            'val_accuracies': val_accuracies,
-            'val_accuracy_max': val_mIoU_max,
-            'val_mIoUs': val_mIoUs,
-            'lr': optimizer.param_groups[0]['lr']
-            }
-            torch.save(checkpoint, best_val_checkpoint_path)
+        #     # Get the current learning rate from the optimizer
+        #     current_lr = optimizer.param_groups[0]['lr']
 
-        else:
-            print("val mean IoU did not increase from %.2f\n\n"%(val_mIoU_max))
+        #     print("Epoch %d: Train \nLearning Rate: %.6f"%(epoch, current_lr))
+        #     train_loss, train_accuracy, train_mIoU  = run_1_epoch(model, loss_function, train_loader, optimizer, train= True)
 
-        # Save checkpoint for the last epoch
-        checkpoint = {
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'trianed_epochs': epoch,
-            'train_losses': train_losses,
-            'train_accuracies': train_accuracies,
-            'train_mIoUs': train_mIoUs,
-            'val_losses': val_losses,
-            'val_accuracies': val_accuracies,
-            'val_accuracy_max': val_mIoU_max,
-            'val_mIoUs': val_mIoUs,
-            'lr': optimizer.param_groups[0]['lr']
-            }
+        #     # Update the learning rate scheduler
+        #     scheduler.step()
 
-        torch.save(checkpoint, checkpoint_path)
+        #     # Lists for train loss and accuracy for plotting
+        #     train_losses.append(train_loss)
+        #     train_accuracies.append(train_accuracy)
+        #     train_mIoUs.append(train_mIoU)
 
-    plt.figure()
-    plt.plot(train_accuracies, label="train_accuracy")
-    plt.plot(val_accuracies, label="val_accuracy")
-    plt.legend()
+        #     # Validate the model on validation set
+        #     print("Epoch %d: Validation"%(epoch))
+        #     with torch.no_grad():
+        #         val_loss, val_accuracy, val_mIoU  = run_1_epoch(model, loss_function, val_loader, optimizer, train= False)
 
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
+        #     # Lists for val loss and accuracy for plotting
+        #     val_losses.append(val_loss)
+        #     val_accuracies.append(val_accuracy)
+        #     val_mIoUs.append(val_mIoU)
 
-    plt.title('Training and val Accuracy')
+        #     print('train loss: %.4f'%(train_loss))
+        #     print('val loss: %.4f'%(val_loss))
+        #     print('train_accuracy %.2f' % (train_accuracy))
+        #     print('val_accuracy %.2f' % (val_accuracy))
+        #     print('train_IoU %.2f'%(train_mIoU))
+        #     print('val_IoU %.2f'%(val_mIoU))
 
-    plt.figure()
-    plt.plot(train_losses, label="train_loss")
-    plt.plot(val_losses, label="val_loss")
+        #     if val_mIoU > val_mIoU_max:
+        #         val_mIoU_max = val_mIoU
+        #         print("New max val mean IoU Acheived %.2f. Saving model.\n\n"%(val_mIoU_max))
 
-    plt.legend()
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and val Loss')
+        #         checkpoint = {
+        #         'model': model.state_dict(),
+        #         'optimizer': optimizer.state_dict(),
+        #         'scheduler': scheduler.state_dict(),
+        #         'trianed_epochs': epoch,
+        #         'train_losses': train_losses,
+        #         'train_accuracies': train_accuracies,
+        #         'train_mIoUs': train_mIoUs,
+        #         'val_losses': val_losses,
+        #         'val_accuracies': val_accuracies,
+        #         'val_accuracy_max': val_mIoU_max,
+        #         'val_mIoUs': val_mIoUs,
+        #         'lr': optimizer.param_groups[0]['lr']
+        #         }
+        #         torch.save(checkpoint, best_val_checkpoint_path)
 
-    plt.figure()
-    plt.plot(train_mIoUs, label="train_mIoU")
-    plt.plot(val_mIoUs, label="val_mIoU")
+        #     else:
+        #         print("val mean IoU did not increase from %.2f\n\n"%(val_mIoU_max))
 
-    plt.legend()
-    plt.xlabel('Epoch')
-    plt.ylabel('mIoU')
-    plt.title('Training and val mIoU')
+        #     # Save checkpoint for the last epoch
+        #     checkpoint = {
+        #         'model': model.state_dict(),
+        #         'optimizer': optimizer.state_dict(),
+        #         'scheduler': scheduler.state_dict(),
+        #         'trianed_epochs': epoch,
+        #         'train_losses': train_losses,
+        #         'train_accuracies': train_accuracies,
+        #         'train_mIoUs': train_mIoUs,
+        #         'val_losses': val_losses,
+        #         'val_accuracies': val_accuracies,
+        #         'val_accuracy_max': val_mIoU_max,
+        #         'val_mIoUs': val_mIoUs,
+        #         'lr': optimizer.param_groups[0]['lr']
+        #         }
+
+        #     torch.save(checkpoint, checkpoint_path)
+
+        # plt.figure()
+        # plt.plot(train_accuracies, label="train_accuracy")
+        # plt.plot(val_accuracies, label="val_accuracy")
+        # plt.legend()
+
+        # plt.xlabel('Epoch')
+        # plt.ylabel('Accuracy')
+
+        # plt.title('Training and val Accuracy')
+
+        # plt.figure()
+        # plt.plot(train_losses, label="train_loss")
+        # plt.plot(val_losses, label="val_loss")
+
+        # plt.legend()
+        # plt.xlabel('Epoch')
+        # plt.ylabel('Loss')
+        # plt.title('Training and val Loss')
+
+        # plt.figure()
+        # plt.plot(train_mIoUs, label="train_mIoU")
+        # plt.plot(val_mIoUs, label="val_mIoU")
+
+        # plt.legend()
+        # plt.xlabel('Epoch')
+        # plt.ylabel('mIoU')
+        # plt.title('Training and val mIoU')
 
