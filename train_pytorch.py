@@ -3,7 +3,7 @@ from torchvision.transforms import ColorJitter
 from torchvision import transforms as T
 from datasets import load_dataset
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, random_split, Subset
 from transformers import TrainingArguments, Trainer
 import numpy as np
 import evaluate
@@ -20,6 +20,7 @@ import torch.nn.functional as F
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 from accelerate import Accelerator
+from sklearn.metrics import accuracy_score
 
 class RustDataset(Dataset):
 
@@ -57,6 +58,14 @@ class RustDataset(Dataset):
 
         return sample
     
+def mean_iou(preds, labels, smooth=1e-6):
+    # Assuming preds and labels are (N, H, W) where N is the batch size,
+    # and each value is 0 for background and 1 for the object (binary segmentation)
+    intersection = torch.logical_and(preds, labels).sum((1, 2))
+    union = torch.logical_or(preds, labels).sum((1, 2))
+    iou = (intersection + smooth) / (union + smooth)  # Adding smooth to avoid division by zero
+    return iou.mean().item()  # Mean over the batch
+    
 def mIoU(pred_mask, mask, smooth=1e-10, n_classes=5):
     with torch.no_grad():
         pred_mask = F.softmax(pred_mask, dim=1)
@@ -85,63 +94,17 @@ def pixel_accuracy(output, mask):
         correct = torch.eq(output, mask).int()
         accuracy = float(correct.sum()) / float(correct.numel())
     return accuracy
-  
-def run_1_epoch(model, loss_fn, loader, optimizer = None, train = False):
-    if train:
-        model.train()
-    else:
-        model.eval()
 
-
-    total_correct_preds = 0
-
-    total_loss = 0
-
-    # Number of images we can get by the loader
-    total_samples_in_loader = len(loader.dataset)
-
-    # number of batches we can get by the loader
-    total_batches_in_loader = len(loader)
-
-    for index_of_batch, sample_batch in enumerate(tqdm(loader)):
-
-        # Transfer image_batch to GPU if available
-        image_batch = sample_batch['image'].to('cuda')
-        labels = sample_batch['mask'].to('cuda')
-
-        # Zeroing out the gradients for parameters
-        if train:
-            assert optimizer is not None, "Optimizer must be provided if train=True"
-            optimizer.zero_grad()
-
-        # Forward pass on the input batch
-        output = model(image_batch)
-
-        # Acquire predicted class indices
-        _, predicted = torch.max(output.data, 1) # the dimension 1 corresponds to max along the rows
-
-        # Compute the loss for the minibatch
-        loss = loss_fn(output, labels)
-
-        # Backpropagation
-        if train:
-            loss.backward()
-
-        # Update the parameters using the gradients
-        if train:
-            optimizer.step()
-
-        # Extra variables for calculating loss and accuracy
-        # count total predictions for accuracy calcutuon for this epoch
-        #total_correct_preds += (predicted == labels).sum().item()
-
-        total_loss += loss.item()
-
-    loss = total_loss / total_batches_in_loader
-    accuracy = pixel_accuracy(output, labels)
-    mean_IoU = mIoU(output, labels)
-
-    return loss, accuracy, mean_IoU
+def plot_learning_curves(train_data, val_data, title, ylabel):
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_data, label='Train')
+    plt.plot(val_data, label='Validation')
+    plt.title(title)
+    plt.xlabel('Epochs')
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
     
 if __name__ == "__main__":
 
@@ -157,7 +120,7 @@ if __name__ == "__main__":
 
     train_transform = T.Compose([
         # T.Resize(512, 512),
-        T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
+        # T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
         T.ToTensor(),
         T.Normalize(mean, std)
     ])
@@ -172,14 +135,27 @@ if __name__ == "__main__":
     device = accelerator.device
 
     #datasets
-    train_set = RustDataset(IMAGE_PATH, MASK_PATH, mean, std, train_transform)
-    val_set = RustDataset(IMAGE_PATH, MASK_PATH, mean, std, val_transform)
+    dataset = RustDataset(IMAGE_PATH, MASK_PATH, mean, std, train_transform)
+    # val_set = RustDataset(IMAGE_PATH, MASK_PATH, mean, std, val_transform)
+
+    # Split the dataset into train and validation sets
+    num_samples = len(dataset)
+    num_train = int(num_samples * 0.8)
+    num_val = num_samples - num_train
+
+    train_dataset, val_dataset = random_split(dataset, [num_train, num_val])
 
     #dataloader
     batch_size= 4
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=True, num_workers=4)
+    # # Applying different transforms to the validation subset if necessary
+    # val_dataset = Subset(dataset, [x.indices for x in val_dataset])
+    # for idx in val_dataset.indices:
+    #     dataset.files[idx] = val_transform(dataset.files[idx])
+
+    # Create DataLoaders for training and validation
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
 
     hf_dataset_identifier = "hjawad367/ADE_20"
 
@@ -225,147 +201,92 @@ if __name__ == "__main__":
 
     # Start epoch is zer
     # o for new training
-    num_training_steps = 1000
+    num_training_steps = 100
     start_epoch = 0
-    progress_bar = tqdm(range(num_training_steps))
-
-    model.train()
+    # progress_bar = tqdm(range(num_training_steps))
+    current_step = 0
 
     for epoch in range(start_epoch, epochs):
 
-        # # with torch.no_grad:
-        # model.zero_grad()
+        print(f"\nEpoch: {epoch}\n")
+
+        model.train()
+        train_epoch_losses = []
+        train_epoch_predictions = []
+        train_epoch_labels = []
+
+        # Reinitialize progress bar for the actual number of batches in this epoch
+        progress_bar = tqdm(total=len(train_loader), desc=f"Epoch {epoch}")
+
         for batch in train_loader:
 
-            with accelerator.accumulate(model):
+            optimizer.zero_grad()
 
+            with accelerator.accumulate():
                 batch = {k: v for k, v in batch.items()}
                 outputs = model(**batch)
                 loss = outputs.loss
-                # loss.backward()
                 accelerator.backward(loss=loss)
 
-                print()
-                print(f"Loss: {loss}")
-                train_losses.append(loss)
+                train_epoch_losses.append(loss.item())
+                logits = outputs.logits
+                predictions = torch.argmax(logits, dim=-1)
+                train_epoch_predictions.extend(predictions.cpu().numpy())
+                train_epoch_labels.extend(batch["labels"].cpu().numpy())
 
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
                 progress_bar.update(1)
+                current_step += 1
 
-                metric = evaluate.load("accuracy")
-                model.eval()
-                for batch in eval_dataloader:
-                    batch = {k: v.to(device) for k, v in batch.items()}
-                    with torch.no_grad():
-                        outputs = model(**batch)
+        train_loss = np.mean(train_epoch_losses)
+        train_accuracy = accuracy_score(train_epoch_labels, train_epoch_predictions)
+        train_mIoU = mean_iou(train_epoch_labels, train_epoch_predictions)
+        train_losses.append(train_loss)
+        train_accuracies.append(train_accuracy)
+        train_mIoUs.append(train_mIoU)
 
-                    logits = outputs.logits
-                    predictions = torch.argmax(logits, dim=-1)
-                    metric.add_batch(predictions=predictions, references=batch["labels"])
+        model.eval()
+        val_epoch_losses = []
+        val_epoch_predictions = []
+        val_epoch_labels = []
+        # metric = evaluate.load("mean_iou")
+        # metric_acc = evaluate.load("accuracy")
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = model(**batch)
+                loss = outputs.loss
+                logits = outputs.logits
+                predictions = torch.argmax(logits, dim=-1)
 
-        model.save()
+                val_epoch_losses.append(loss.item())
+                val_epoch_predictions.extend(predictions.cpu().numpy())
+                val_epoch_labels.extend(batch["labels"].cpu().numpy())
+                # metric.add_batch(predictions=predictions, references=batch["labels"])
 
-        #     # Train model for one epoch
+        val_loss = np.mean(val_epoch_losses)
+        val_accuracy = accuracy_score(val_epoch_labels, val_epoch_predictions)
+        val_mIoU = mean_iou(val_epoch_labels, val_epoch_predictions)
+        val_losses.append(val_loss)
+        val_accuracies.append(val_accuracy)
+        val_mIoUs.append(val_mIoU)
 
-        #     # Get the current learning rate from the optimizer
-        #     current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch}: Train Loss: {train_loss}, Val Loss: {val_loss}, Train Accuracy: {train_accuracy}, Val Accuracy: {val_accuracy}")
 
-        #     print("Epoch %d: Train \nLearning Rate: %.6f"%(epoch, current_lr))
-        #     train_loss, train_accuracy, train_mIoU  = run_1_epoch(model, loss_function, train_loader, optimizer, train= True)
 
-        #     # Update the learning rate scheduler
-        #     scheduler.step()
+        # validation_iou = metric.compute()
+        # validation_acc = metric_acc.compute()
+        # print(f"Validation IoU: {validation_iou}")
+        # # Here you could add a check to save the model only if it improves
 
-        #     # Lists for train loss and accuracy for plotting
-        #     train_losses.append(train_loss)
-        #     train_accuracies.append(train_accuracy)
-        #     train_mIoUs.append(train_mIoU)
+        torch.save(model.state_dict(), f'segformer_results/model_epoch_{epoch}.pth')
 
-        #     # Validate the model on validation set
-        #     print("Epoch %d: Validation"%(epoch))
-        #     with torch.no_grad():
-        #         val_loss, val_accuracy, val_mIoU  = run_1_epoch(model, loss_function, val_loader, optimizer, train= False)
+    # Plot learning curves for loss
+    plot_learning_curves(train_losses, val_losses, "Learning Curve (Loss)", "Loss")
 
-        #     # Lists for val loss and accuracy for plotting
-        #     val_losses.append(val_loss)
-        #     val_accuracies.append(val_accuracy)
-        #     val_mIoUs.append(val_mIoU)
+    # Plot learning curves for accuracy
+    plot_learning_curves(train_accuracies, val_accuracies, "Learning Curve (Accuracy)", "Accuracy")
 
-        #     print('train loss: %.4f'%(train_loss))
-        #     print('val loss: %.4f'%(val_loss))
-        #     print('train_accuracy %.2f' % (train_accuracy))
-        #     print('val_accuracy %.2f' % (val_accuracy))
-        #     print('train_IoU %.2f'%(train_mIoU))
-        #     print('val_IoU %.2f'%(val_mIoU))
-
-        #     if val_mIoU > val_mIoU_max:
-        #         val_mIoU_max = val_mIoU
-        #         print("New max val mean IoU Acheived %.2f. Saving model.\n\n"%(val_mIoU_max))
-
-        #         checkpoint = {
-        #         'model': model.state_dict(),
-        #         'optimizer': optimizer.state_dict(),
-        #         'scheduler': scheduler.state_dict(),
-        #         'trianed_epochs': epoch,
-        #         'train_losses': train_losses,
-        #         'train_accuracies': train_accuracies,
-        #         'train_mIoUs': train_mIoUs,
-        #         'val_losses': val_losses,
-        #         'val_accuracies': val_accuracies,
-        #         'val_accuracy_max': val_mIoU_max,
-        #         'val_mIoUs': val_mIoUs,
-        #         'lr': optimizer.param_groups[0]['lr']
-        #         }
-        #         torch.save(checkpoint, best_val_checkpoint_path)
-
-        #     else:
-        #         print("val mean IoU did not increase from %.2f\n\n"%(val_mIoU_max))
-
-        #     # Save checkpoint for the last epoch
-        #     checkpoint = {
-        #         'model': model.state_dict(),
-        #         'optimizer': optimizer.state_dict(),
-        #         'scheduler': scheduler.state_dict(),
-        #         'trianed_epochs': epoch,
-        #         'train_losses': train_losses,
-        #         'train_accuracies': train_accuracies,
-        #         'train_mIoUs': train_mIoUs,
-        #         'val_losses': val_losses,
-        #         'val_accuracies': val_accuracies,
-        #         'val_accuracy_max': val_mIoU_max,
-        #         'val_mIoUs': val_mIoUs,
-        #         'lr': optimizer.param_groups[0]['lr']
-        #         }
-
-        #     torch.save(checkpoint, checkpoint_path)
-
-        # plt.figure()
-        # plt.plot(train_accuracies, label="train_accuracy")
-        # plt.plot(val_accuracies, label="val_accuracy")
-        # plt.legend()
-
-        # plt.xlabel('Epoch')
-        # plt.ylabel('Accuracy')
-
-        # plt.title('Training and val Accuracy')
-
-        # plt.figure()
-        # plt.plot(train_losses, label="train_loss")
-        # plt.plot(val_losses, label="val_loss")
-
-        # plt.legend()
-        # plt.xlabel('Epoch')
-        # plt.ylabel('Loss')
-        # plt.title('Training and val Loss')
-
-        # plt.figure()
-        # plt.plot(train_mIoUs, label="train_mIoU")
-        # plt.plot(val_mIoUs, label="val_mIoU")
-
-        # plt.legend()
-        # plt.xlabel('Epoch')
-        # plt.ylabel('mIoU')
-        # plt.title('Training and val mIoU')
-
+    # Plot learning curves for Mean IoU
+    plot_learning_curves(train_mIoUs, val_mIoUs, "Learning Curve (mIoU)", "Mean IoU")
