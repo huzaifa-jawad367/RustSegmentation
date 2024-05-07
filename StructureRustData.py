@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import random
 import shutil
+from PIL import Image
 
 def save_non_rust_masks():
     # Define source and destination directories
@@ -49,13 +50,8 @@ def print_unique_mask_vals(dir_path):
     for filename in os.listdir(dir_path):
         file_path = os.path.join(dir_path, filename)
         if os.path.isfile(file_path):  # Check if it's a file (not a subdirectory)
-            unique_mask_vals = set()  # Initialize an empty set for unique mask values
-            with open(file_path, 'r') as file:
-                # Read the contents of the file and split it into lines
-                lines = file.readlines()
-                # Iterate over each line and extract unique values
-                for line in lines:
-                    unique_mask_vals.update(line.strip().split(','))
+            mask = np.array(Image.open(file_path))
+            unique_mask_vals = np.unique(mask)
 
             # Print the filename and its unique mask values
             print(f"Unique values for {filename}: {unique_mask_vals}")
@@ -63,31 +59,45 @@ def print_unique_mask_vals(dir_path):
 def threshold(img, threshold_val=0):
     pass
 
-def sample_images(image_dir, mask_dir, output_image_dir, output_mask_dir, num_samples=1700):
-    # Ensure output directories exist
-    os.makedirs(output_image_dir, exist_ok=True)
-    os.makedirs(output_mask_dir, exist_ok=True)
+def sample_images_and_masks(src_images_dir, src_masks_dir, dest_images_dir, dest_masks_dir, n_samples):
+    """
+    Randomly samples images and their corresponding masks from specified directories and copies them to new directories.
 
-    # Get the list of images in the directory
-    images = os.listdir(image_dir)
-    random.shuffle(images)  # Shuffle the list for random sampling
+    Args:
+    src_images_dir (str): Source directory containing the original images.
+    src_masks_dir (str): Source directory containing the mask images.
+    dest_images_dir (str): Destination directory to store sampled images.
+    dest_masks_dir (str): Destination directory to store corresponding masks.
+    n_samples (int): Number of images and masks to sample.
+    """
+    # Create the destination directories if they don't exist
+    os.makedirs(dest_images_dir, exist_ok=True)
+    os.makedirs(dest_masks_dir, exist_ok=True)
 
-    # Sample images
-    sampled_images = images[:num_samples]
+    # Get a list of all files in the source image directory
+    all_files = os.listdir(src_images_dir)
+    # Ensure that we do not sample more files than exist
+    n_samples = min(n_samples, len(all_files))
 
-    # Copy the sampled images and masks to the output directories
-    for image_name in sampled_images:
-        image_path = os.path.join(image_dir, image_name)
-        mask_path = os.path.join(mask_dir, image_name)
+    # Randomly sample file names
+    sampled_files = random.sample(all_files, n_samples)
 
-        # Ensure the mask exists
-        if os.path.exists(mask_path):
-            shutil.copy(image_path, os.path.join(output_image_dir, image_name))
-            shutil.copy(mask_path, os.path.join(output_mask_dir, image_name))
-        else:
-            print(f"Mask not found for image: {image_name}")
+    # Copy the sampled images and their corresponding masks to the destination directories
+    for filename in sampled_files:
+        src_image_path = os.path.join(src_images_dir, filename)
+        src_mask_path = os.path.join(src_masks_dir, filename)  # assuming mask has the same file name
+        dest_image_path = os.path.join(dest_images_dir, filename)
+        dest_mask_path = os.path.join(dest_masks_dir, filename)
 
-    print("Sampling and copying complete.")
+        # Copy files
+        shutil.copy(src_image_path, dest_image_path)
+        shutil.copy(src_mask_path, dest_mask_path)
+
+
+# if __name__=='__main__':
+#     # print_unique_mask_vals('data/Training_OG/mask')
+#     sample_images_and_masks('data/Training-2/non_rust', 'data/Training-2/masks_non_rust', 'data/Training_OG/image', 'data/Training_OG/mask', 1700)
+
 
 # for d in os.listdir('Training-2'):
 #     print(f"{d}:" + f" {len(os.listdir(f'Training-2/{d}'))}")
