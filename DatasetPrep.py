@@ -2,6 +2,12 @@ from datasets import Dataset, DatasetDict, Image
 import os
 import pyarrow.parquet as pq
 
+def create_dataset(image_paths, label_paths):
+    dataset = Dataset.from_dict({"pixel_values": sorted(image_paths),
+                                "label": sorted(label_paths)})
+    dataset = dataset.cast_column("pixel_values", Image())
+    dataset = dataset.cast_column("label", Image())
+    return dataset
 
 def get_dataset():
     list_of_img_dirs = [f'Training-2/{x}' for x in os.listdir('Training-2') if 'mask' not in x]
@@ -28,13 +34,6 @@ def get_dataset():
     # image_paths_validation = [...]
     # label_paths_validation = [...]
 
-    def create_dataset(image_paths, label_paths):
-        dataset = Dataset.from_dict({"pixel_values": sorted(image_paths),
-                                    "label": sorted(label_paths)})
-        dataset = dataset.cast_column("pixel_values", Image())
-        dataset = dataset.cast_column("label", Image())
-        return dataset
-
     # step 1: create Dataset objects
     train_dataset = create_dataset(image_paths_train, label_paths_train)
     # validation_dataset = create_dataset(image_paths_validation, label_paths_validation)
@@ -50,4 +49,27 @@ def get_dataset():
 # step 3: push to Hub (assumes you have ran the huggingface-cli login command in a terminal/notebook)
 # dataset.push_to_hub("hjawad367/Rust_aug")
 
-get_dataset()
+def get_NWRD_Dataset():
+    image_paths_train = [f"data/NWRD Dataset/NWRD Dataset/train/images/{x}" for x in os.listdir('data/NWRD Dataset/NWRD Dataset/train/images')]
+    mask_paths_train = [f"data/NWRD Dataset/NWRD Dataset/train/masks/{x}" for x in os.listdir('data/NWRD Dataset/NWRD Dataset/train/masks')]
+
+    image_paths_test = [f"data/NWRD Dataset/NWRD Dataset/test/images/{x}" for x in os.listdir('data/NWRD Dataset/NWRD Dataset/test/images')]
+    mask_paths_test = [f"data/NWRD Dataset/NWRD Dataset/test/masks/{x}" for x in os.listdir('data/NWRD Dataset/NWRD Dataset/test/masks')]
+
+    print(len(image_paths_train))
+    print(len(mask_paths_train))
+
+    train_dataset = create_dataset(image_paths_train, mask_paths_train)
+    test_dataset = create_dataset(image_paths_test, mask_paths_test)
+
+    dataset = DatasetDict({
+        "train": train_dataset,
+        "test": test_dataset
+        }
+    )
+
+    return dataset
+
+
+
+get_NWRD_Dataset()

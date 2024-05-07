@@ -10,7 +10,7 @@ import evaluate
 import json
 from huggingface_hub import hf_hub_download
 from torch import nn
-from DatasetPrep import get_dataset
+from DatasetPrep import get_NWRD_Dataset
 from pynvml import *
 import cv2
 from PIL import Image
@@ -43,44 +43,44 @@ def val_transforms(example_batch):
     inputs = processor(images, labels)
     return inputs
 
-def compute_metrics(eval_pred):
-  with torch.no_grad():
-    logits, labels = eval_pred
-    logits_tensor = torch.from_numpy(logits)
-    # scale the logits to the size of the label
-    logits_tensor = nn.functional.interpolate(
-        logits_tensor,
-        size=labels.shape[-2:],
-        mode="bilinear",
-        align_corners=False,
-    ).argmax(dim=1)
+# def compute_metrics(eval_pred):
+#   with torch.no_grad():
+#     logits, labels = eval_pred
+#     logits_tensor = torch.from_numpy(logits)
+#     # scale the logits to the size of the label
+#     logits_tensor = nn.functional.interpolate(
+#         logits_tensor,
+#         size=labels.shape[-2:],
+#         mode="bilinear",
+#         align_corners=False,
+#     ).argmax(dim=1)
 
-    pred_labels = logits_tensor.detach().cpu().numpy()
-    # currently using _compute instead of compute
-    # see this issue for more info: https://github.com/huggingface/evaluate/pull/328#issuecomment-1286866576
-    metrics = metric._compute(
-            predictions=pred_labels,
-            references=labels,
-            num_labels=len(id2label),
-            ignore_index=0,
-            reduce_labels=processor.do_reduce_labels,
-        )
+#     pred_labels = logits_tensor.detach().cpu().numpy()
+#     # currently using _compute instead of compute
+#     # see this issue for more info: https://github.com/huggingface/evaluate/pull/328#issuecomment-1286866576
+#     metrics = metric._compute(
+#             predictions=pred_labels,
+#             references=labels,
+#             num_labels=len(id2label),
+#             ignore_index=0,
+#             reduce_labels=processor.do_reduce_labels,
+#         )
     
-    # add per category metrics as individual key-value pairs
-    per_category_accuracy = metrics.pop("per_category_accuracy").tolist()
-    per_category_iou = metrics.pop("per_category_iou").tolist()
+#     # add per category metrics as individual key-value pairs
+#     per_category_accuracy = metrics.pop("per_category_accuracy").tolist()
+#     per_category_iou = metrics.pop("per_category_iou").tolist()
 
-    metrics.update({f"accuracy_{id2label[i]}": v for i, v in enumerate(per_category_accuracy)})
-    metrics.update({f"iou_{id2label[i]}": v for i, v in enumerate(per_category_iou)})
+#     metrics.update({f"accuracy_{id2label[i]}": v for i, v in enumerate(per_category_accuracy)})
+#     metrics.update({f"iou_{id2label[i]}": v for i, v in enumerate(per_category_iou)})
     
-    return metrics
+#     return metrics
 
 hf_dataset_identifier = "hjawad367/ADE_20"
 
 processor = SegformerImageProcessor()
 jitter = ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.1) 
 
-ds = get_dataset()
+ds = get_NWRD_Dataset()
 
 ds = ds.shuffle(seed=1)
 ds = ds["train"].train_test_split(test_size=0.2)
@@ -91,7 +91,7 @@ test_ds = ds["test"]
 train_ds.set_transform(train_transforms)
 test_ds.set_transform(val_transforms)
 
-
+print(train_ds)
 
 # train_ds = train_ds.rename_column('image', 'pixel_values')
 # test_ds = test_ds.rename_column('image', 'pixel_values')

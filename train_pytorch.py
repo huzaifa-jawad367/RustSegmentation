@@ -10,7 +10,7 @@ import evaluate
 import json
 from huggingface_hub import hf_hub_download
 from torch import nn
-from DatasetPrep import get_dataset
+# from DatasetPrep import get_dataset
 from pynvml import *
 import cv2
 from PIL import Image
@@ -20,6 +20,7 @@ import torch.nn.functional as F
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 from accelerate import Accelerator
+
 from sklearn.metrics import accuracy_score
 
 class RustDataset(Dataset):
@@ -34,7 +35,7 @@ class RustDataset(Dataset):
         self.files = sorted(os.listdir(self.img_path))
 
     def __len__(self):
-        return len(os.listdir('Training/image'))
+        return len(os.listdir('data/Training/image'))
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
@@ -115,8 +116,8 @@ if __name__ == "__main__":
     mean=[0.485, 0.456, 0.406]
     std=[0.229, 0.224, 0.225]
 
-    IMAGE_PATH = 'Training\image'
-    MASK_PATH = 'Training\mask'
+    IMAGE_PATH = 'data/Training/image'
+    MASK_PATH = 'data/Training/mask'
 
     train_transform = T.Compose([
         # T.Resize(512, 512),
@@ -206,6 +207,9 @@ if __name__ == "__main__":
     # progress_bar = tqdm(range(num_training_steps))
     current_step = 0
 
+    num_labels = 255
+    ignore_index = 0
+
     for epoch in range(start_epoch, epochs):
 
         print(f"\nEpoch: {epoch}\n")
@@ -217,6 +221,7 @@ if __name__ == "__main__":
 
         # Reinitialize progress bar for the actual number of batches in this epoch
         progress_bar = tqdm(total=len(train_loader), desc=f"Epoch {epoch}")
+        # train_metric = evaluate.load("mean_iou", num_labels=num_labels, ignore_index=ignore_index)
 
         for batch in train_loader:
 
@@ -234,23 +239,26 @@ if __name__ == "__main__":
                 train_epoch_predictions.extend(predictions.cpu().numpy())
                 train_epoch_labels.extend(batch["labels"].cpu().numpy())
 
+                # train_metric.add_batch(predictions=predictions, references=batch["labels"])
+
                 optimizer.step()
                 scheduler.step()
                 progress_bar.update(1)
                 current_step += 1
 
         train_loss = np.mean(train_epoch_losses)
-        train_accuracy = accuracy_score(train_epoch_labels, train_epoch_predictions)
-        train_mIoU = mean_iou(train_epoch_labels, train_epoch_predictions)
+        # train_accuracy = accuracy_score(train_epoch_labels, train_epoch_predictions)
+        # train_mIoU = mean_iou(train_epoch_labels, train_epoch_predictions)
         train_losses.append(train_loss)
-        train_accuracies.append(train_accuracy)
-        train_mIoUs.append(train_mIoU)
+        # train_accuracies.append(train_accuracy)
+        # train_mIoUs.append(train_mIoU)
+        # train_iou = train_metric.compute(num_labels=num_labels, ignore_index=ignore_index)
 
         model.eval()
         val_epoch_losses = []
         val_epoch_predictions = []
         val_epoch_labels = []
-        # metric = evaluate.load("mean_iou")
+        # val_metric = evaluate.load("mean_iou")
         # metric_acc = evaluate.load("accuracy")
         with torch.no_grad():
             for batch in val_loader:
@@ -263,16 +271,19 @@ if __name__ == "__main__":
                 val_epoch_losses.append(loss.item())
                 val_epoch_predictions.extend(predictions.cpu().numpy())
                 val_epoch_labels.extend(batch["labels"].cpu().numpy())
-                # metric.add_batch(predictions=predictions, references=batch["labels"])
+                # val_metric.add_batch(predictions=predictions, references=batch["labels"])
 
         val_loss = np.mean(val_epoch_losses)
-        val_accuracy = accuracy_score(val_epoch_labels, val_epoch_predictions)
-        val_mIoU = mean_iou(val_epoch_labels, val_epoch_predictions)
+        # val_accuracy = accuracy_score(val_epoch_labels, val_epoch_predictions)
+        # val_mIoU = mean_iou(val_epoch_labels, val_epoch_predictions)
         val_losses.append(val_loss)
-        val_accuracies.append(val_accuracy)
-        val_mIoUs.append(val_mIoU)
+        # val_accuracies.append(val_accuracy)
+        # val_mIoUs.append(val_mIoU)
+        # val_iou = val_metric.compute(num_labels=num_labels, ignore_index=ignore_index)
 
-        print(f"Epoch {epoch}: Train Loss: {train_loss}, Val Loss: {val_loss}, Train Accuracy: {train_accuracy}, Val Accuracy: {val_accuracy}")
+        # print(f"Epoch {epoch}: Train Loss: {train_loss}, Val Loss: {val_loss}, Train Accuracy: {train_accuracy}, Val Accuracy: {val_accuracy}")
+        print(f"Epoch {epoch}: Train Loss: {train_loss}, Val Loss: {val_loss}")
+
 
 
         # validation_iou = metric.compute()
@@ -280,13 +291,14 @@ if __name__ == "__main__":
         # print(f"Validation IoU: {validation_iou}")
         # # Here you could add a check to save the model only if it improves
 
-        torch.save(model.state_dict(), f'segformer_results/model_epoch_{epoch}.pth')
+        # torch.save(model.state_dict(), f'segformer_results/model_epoch_{epoch}_val_loss_{val_loss}.pth')
+        model.save_pretrained(f'segformer_results/model_epoch_{epoch}')
 
     # Plot learning curves for loss
     plot_learning_curves(train_losses, val_losses, "Learning Curve (Loss)", "Loss")
 
-    # Plot learning curves for accuracy
-    plot_learning_curves(train_accuracies, val_accuracies, "Learning Curve (Accuracy)", "Accuracy")
+    # # Plot learning curves for accuracy
+    # plot_learning_curves(train_accuracies, val_accuracies, "Learning Curve (Accuracy)", "Accuracy")
 
-    # Plot learning curves for Mean IoU
-    plot_learning_curves(train_mIoUs, val_mIoUs, "Learning Curve (mIoU)", "Mean IoU")
+    # # Plot learning curves for Mean IoU
+    # plot_learning_curves(train_mIoUs, val_mIoUs, "Learning Curve (mIoU)", "Mean IoU")
